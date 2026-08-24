@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🧺 Корзинка с фруктами</title>
+  <style>
+    :root { --bg: #0a0e14; --accent: #4caf50; --warn: #ffc107; --text: #e0e6ed; }
+    * { box-sizing: border-box; user-select: none; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; overflow: hidden; }
+    canvas { display: block; width: 100vw; height: 100vh; }
+    
+    .overlay {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      background: rgba(10, 14, 20, 0.95); z-index: 10; transition: opacity 0.3s;
+    }
+    .hidden { opacity: 0; pointer-events: none; }
+    
+    h1 { font-size: 2rem; margin-bottom: 0.5rem; color: #ffab91; text-align: center; text-shadow: 0 0 10px rgba(255,171,145,0.3); }
+    p { max-width: 420px; text-align: center; line-height: 1.6; margin-bottom: 1.5rem; font-size: 1rem; color: #b0bec5; }
+    
+    button {
+      padding: 12px 28px; font-size: 1rem; font-weight: 600; background: var(--accent); color: #fff;
+      border: none; border-radius: 12px; cursor: pointer; transition: all 0.2s;
+      margin: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+    }
+    button:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-2px); box-shadow: 0 6px 12px rgba(0,0,0,0.3); }
+    button:active:not(:disabled) { transform: translateY(0); }
+    button:disabled { background: #37474f; color: #78909c; cursor: not-allowed; transform: none; box-shadow: none; }
+    button.stop { background: #e53935; }
+    
+    #status { margin-top: 12px; font-size: 0.9rem; color: #8892a0; min-height: 1.5em; text-align: center; display: flex; align-items: center; gap: 8px; }
+    
+    #hud {
+      position: fixed; top: 20px; left: 50%; transform: translateX(-50%); 
+      background: rgba(15, 20, 25, 0.85); padding: 8px 20px; border-radius: 50px; 
+      z-index: 5; font-size: 1rem; display: flex; gap: 20px; align-items: center;
+      backdrop-filter: blur(8px); border: 1px solid rgba(255,255,255,0.1);
+      box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+    }
+    
+    .spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.2);
+      border-top-color: var(--accent); border-radius: 50%; animation: spin 1s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    
+    .stat-item { display: flex; align-items: center; gap: 6px; }
+    .stat-val { font-weight: bold; color: #fff; }
+  </style>
+</head>
+<body>
+  <video id="webcam" autoplay playsinline style="display:none"></video>
+  <canvas id="game"></canvas>
+  
+  <div id="hud" class="hidden">
+    <div class="stat-item">🍎 <span id="hud-placed" class="stat-val">0</span>/7</div>
+    <div class="stat-item">⏱️ <span id="hud-timer" class="stat-val">0:00</span></div>
+    <div class="stat-item">🌊 <span id="hud-smooth" class="stat-val">100%</span></div>
+    <button id="btn-stop" class="stop" style="padding: 6px 16px; font-size: 0.9rem; margin-left: 10px;">⏹️ Стоп</button>
+  </div>
+
+  <!-- СТАРТ -->
+  <div id="start-screen" class="overlay">
+    <h1>🧺 Корзинка с фруктами</h1>
+    <p>
+      🖐️ <b>Открытая ладонь</b> = перемещение руки.<br>
+      ✊ <b>Сжатый кулак</b> = взять фрукт.<br>
+      Разожмите кулак над корзинкой, чтобы положить фрукт.<br>
+      <small style="color:#78909c">Фрукт засчитывается, только если он полностью внутри корзинки.</small>
+    </p>
+    <button id="btn-perm">📷 1. Разрешить камеру</button>
+    <button id="btn-start" disabled>▶️ 2. Начать сбор урожая</button>
+    <div id="status">Ожидание действия...</div>
+  </div>
+
+  <!-- УСПЕХ -->
+  <div id="success-screen" class="overlay hidden">
+    <h2>🎉 Урожай собран!</h2>
+    <p id="end-stats">Время: 0с | Плавность: 100%</p>
+    <div>
+      <button onclick="Game.downloadMetrics()">📥 Скачать отчёт</button>
+      <button onclick="location.reload()" style="background:#546e7a; margin-left:10px;">🔄 Заново</button>
+    </div>
+  </div>
+
+  <script>
+    const loadScript = (src) => {
+      return new Promise((resolve, reject) => {
+        if (document.querySelector(`script[src="${src}"]`)) return resolve();
+        const s = document.createElement('script');
+        s.src = src;
+        s.onload = resolve;
+        s.onerror = reject;
+        document.head.appendChild(s);
+      });
+    };
+
+    const Game = (() => {
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+      const video = document.getElementById('webcam');
+      let W, H;
+      
+      const CFG = {
+        sessionLen: 300, margin: 40, grabDist: 80, smoothing: 0.25
+      };
+
+      let state = 'IDLE'; 
+      let sessionTime = 0, lastFrame = 0;
+      let gameLoopId;
+      let hands = null;
+
+      // Состояние руки
+      const hand = { x: 0, y: 0, rawX: 0, rawY: 0, gesture: 'none', holding: null };
+      
+      // Фрукты для генерации
+      const FRUIT_EMOJIS = ['🍎','🍊','🍋','🍇','🍓','🍒','🥝','🍑','🍐','🥥'];
+      
+      let fruits = [], basket = {x:0,y:0,w:0,h:0};
+      let placedCount = 0;
+      const metrics = { velocities: [], jerks: [], path: 0, smoothness: 100, gripChanges: 0, startTime: 0 };
+
+      function resize() {
+        W = canvas.width = window.innerWidth;
+        H = canvas.height = window.innerHeight;
+        if(state==='IDLE' || state==='READY') {
+            hand.x = W/2; hand.y = H/2; hand.rawX = W/2; hand.rawY = H/2;
+            initLevel();
+        }
+      }
+      window.addEventListener('resize', resize);
+      
+      window.onload = async () => { 
+        resize(); 
+        setStatus('Загрузка нейросети...', '#8892a0');
+        try {
+            await loadScript('https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.min.js');
+            setStatus('✅ Система готова. Включите камеру.', '#4caf50');
+        } catch(e) {
+            setStatus('❌ Ошибка загрузки скриптов. Проверьте интернет.', '#f44336');
+        }
+      };
+
+      function setStatus(txt, color='#8892a0') {
+        const el = document.getElementById('status');
+        el.innerHTML = `<div class="spinner"></div><span>${txt}</span>`;
+        el.style.color = color;
+      }
+
+      function initLevel() {
+        placedCount = 0;
+        document.getElementById('hud-placed').textContent = '0';
+        
+        // Корзинка по центру (35% от меньшей стороны) - ХИТБОКС НЕ ИЗМЕНИЛСЯ
+        const s = Math.min(W, H) * 0.35;
+        basket = { x: (W-s)/2, y: (H-s)/2, w: s, h: s };
+
+        fruits = [];
+        const margin = 50;
+        
+        for(let i=0; i<7; i++) {
+          let cx, cy, r, attempts = 0;
+          let safe = false;
+          while(!safe && attempts < 100) {
+            r = 25 + Math.random() * 15;
+            cx = margin + Math.random() * (W - margin*2);
+            cy = margin + 80 + Math.random() * (H - margin*2 - 80);
+            
+            // Проверка: не внутри корзинки
+            const insideBasket = (cx > basket.x && cx < basket.x + basket.w && 
+                                  cy > basket.y && cy < basket.y + basket.h);
+            
+            // Проверка на наложение
+            let overlap = false;
+            for(let other of fruits) {
+                if(Math.hypot(cx - other.x, cy - other.y) < (r + other.r + 10)) overlap = true;
+            }
+
+            if(!insideBasket && !overlap) safe = true;
+            attempts++;
+          }
+          
+          fruits.push({
+            x: cx, y: cy, r: r,
+            emoji: FRUIT_EMOJIS[i % FRUIT_EMOJIS.length], // Циклически выбираем фрукт
+            placed: false
+          });
+        }
+      }
+
+      async function initCamera() {
+        const btnPerm = document.getElementById('btn-perm');
+        const btnStart = document.getElementById('btn-start');
+        btnPerm.disabled = true; 
+        setStatus('Запрос доступа к камере...', '#ffc107');
+        
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ 
+            video: { width: {ideal: 1280}, height: {ideal: 720}, facingMode: 'user' } 
+          });
+          video.srcObject = stream;
+          await video.play();
+          setStatus('✅ Камера активна. Запуск модели...', '#4caf50');
+          initMediaPipe();
+          btnStart.disabled = false;
+          state = 'READY';
+        } catch (err) {
+          console.error(err);
+          setStatus(`❌ Нет доступа к камере.`, '#f44336');
+          btnPerm.disabled = false;
+        }
+      }
+
+      function initMediaPipe() {
+        hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`});
+        hands.setOptions({ 
+            maxNumHands: 1, modelComplexity: 1, 
+            minDetectionConfidence: 0.7, minTrackingConfidence: 0.6 
+        });
+        hands.onResults(onHandResults);
+        runDetectionLoop();
+      }
+
+      async function runDetectionLoop() {
+        if (state === 'END') return;
+        if(video.readyState >= 2) {
+            await hands.send({image: video});
+        }
+        requestAnimationFrame(runDetectionLoop);
+      }
+
+      function onHandResults(results) {
+        if (results.multiHandLandmarks?.length > 0) {
+          const lm = results.multiHandLandmarks[0];
+          const rawX = (1 - lm[9].x) * W; 
+          const rawY = lm[9].y * H;
+          
+          hand.rawX = rawX;
+          hand.rawY = rawY;
+
+          const wrist = lm[0];
+          const tips = [8, 12, 16, 20].map(i => lm[i]);
+          const avgDist = tips.reduce((s, t) => s + Math.hypot(t.x - wrist.x, t.y - wrist.y), 0) / 4;
+          
+          if (avgDist > 0.30) hand.gesture = 'open';
+          else if (avgDist < 0.15) hand.gesture = 'fist';
+          else hand.gesture = 'transition';
+          
+        } else {
+          hand.gesture = 'none';
+          if (hand.holding) dropFruit();
+        }
+      }
+
+      function updatePhysics(dt) {
+        hand.x += (hand.rawX - hand.x) * CFG.smoothing;
+        hand.y += (hand.rawY - hand.y) * CFG.smoothing;
+
+        hand.x = Math.max(CFG.margin, Math.min(W - CFG.margin, hand.x));
+        hand.y = Math.max(CFG.margin, Math.min(H - CFG.margin, hand.y));
+
+        const dx = hand.x - (metrics.lastX || hand.x);
+        const dy = hand.y - (metrics.lastY || hand.y);
+        const speed = Math.sqrt(dx*dx + dy*dy) / dt;
+        
+        if(state === 'PLAY') {
+            metrics.velocities.push(speed);
+            metrics.path += Math.abs(speed);
+            
+            if (metrics.lastX !== undefined) {
+              const jerk = Math.abs(speed - (metrics.lastSpeed || 0));
+              metrics.jerks.push(jerk);
+            }
+            metrics.lastX = hand.x; metrics.lastY = hand.y; metrics.lastSpeed = speed;
+
+            if (hand.gesture === 'fist' && !hand.holding) {
+              let closest = null;
+              let minDst = CFG.grabDist;
+              
+              for (let f of fruits) {
+                if (!f.placed) {
+                    const dist = Math.hypot(hand.x - f.x, hand.y - f.y);
+                    if (dist < minDst) {
+                        minDst = dist;
+                        closest = f;
+                    }
+                }
+              }
+              
+              if (closest) {
+                hand.holding = closest;
+                metrics.gripChanges++;
+              }
+            }
+            
+            if (hand.holding) {
+              hand.holding.x = hand.x;
+              hand.holding.y = hand.y;
+              if (hand.gesture === 'open') dropFruit();
+            }
+        }
+      }
+
+      function dropFruit() {
+        if (!hand.holding) return;
+        const f = hand.holding;
+        
+        // ХИТБОКС НЕ ИЗМЕНИЛСЯ - та же строгая проверка
+        const buffer = 2;
+        const fullyInside = (f.x - f.r >= basket.x + buffer) && 
+                            (f.x + f.r <= basket.x + basket.w - buffer) &&
+                            (f.y - f.r >= basket.y + buffer) && 
+                            (f.y + f.r <= basket.y + basket.h - buffer);
+        
+        if (fullyInside) {
+          f.placed = true;
+          placedCount++;
+          document.getElementById('hud-placed').textContent = placedCount;
+          if(navigator.vibrate) navigator.vibrate(50);
+          if (placedCount === 7) setTimeout(stopGame, 400);
+        }
+        hand.holding = null;
+      }
+
+      function startGame() {
+        document.getElementById('start-screen').classList.add('hidden');
+        document.getElementById('hud').classList.remove('hidden');
+        state = 'PLAY';
+        sessionTime = 0;
+        lastFrame = performance.now();
+        metrics.startTime = Date.now();
+        metrics.velocities = []; metrics.jerks = []; metrics.path = 0; metrics.gripChanges = 0;
+        initLevel();
+        requestAnimationFrame(gameLoop);
+      }
+
+      function stopGame() {
+        if(state === 'END') return;
+        state = 'END'; 
+        cancelAnimationFrame(gameLoopId);
+        
+        document.getElementById('hud').classList.add('hidden');
+        document.getElementById('success-screen').classList.remove('hidden');
+        
+        metrics.smoothness = Math.max(0, 100 - (avg(metrics.jerks) * 20));
+        const sec = Math.floor(sessionTime);
+        document.getElementById('end-stats').innerHTML = 
+            `Время: <b>${sec}с</b><br>Плавность: <b>${Math.round(metrics.smoothness)}%</b><br>Лишних движений: ${metrics.gripChanges}`;
+      }
+
+      function gameLoop(now) {
+        if (state !== 'PLAY' && state !== 'END') return;
+        
+        const dt = Math.min((now - lastFrame) / 16.67, 3.0);
+        lastFrame = now;
+        if(state === 'PLAY') sessionTime += (dt * 16.67) / 1000;
+
+        updatePhysics(dt);
+
+        // --- Отрисовка ---
+        ctx.clearRect(0, 0, W, H);
+        
+        // Видео фон (Зеркальный)
+        ctx.save();
+        ctx.translate(W, 0); ctx.scale(-1, 1);
+        ctx.globalAlpha = 0.6;
+        ctx.drawImage(video, 0, 0, W, H);
+        ctx.restore();
+        
+        ctx.fillStyle = 'rgba(10, 14, 20, 0.6)';
+        ctx.fillRect(0, 0, W, H);
+
+        // 🧺 КОРЗИНКА (визуальная замена квадрата, хитбокс тот же)
+        ctx.save();
+        // Тень корзинки
+        ctx.shadowColor = 'rgba(141, 110, 68, 0.6)';
+        ctx.shadowBlur = 25;
+        
+        // Рисуем "корзинку" как стилизованную область
+        const bx = basket.x, by = basket.y, bw = basket.w, bh = basket.h;
+        
+        // Плетёный узор (декоративный)
+        ctx.strokeStyle = 'rgba(141, 110, 68, 0.8)';
+        ctx.lineWidth = 3;
+        ctx.setLineDash([8, 6]);
+        ctx.strokeRect(bx + 8, by + 8, bw - 16, bh - 16);
+        ctx.setLineDash([]);
+        
+        // Заливка зоны
+        ctx.fillStyle = 'rgba(141, 110, 68, 0.12)';
+        ctx.fillRect(bx, by, bw, bh);
+        
+        // Эмодзи корзинки по центру
+        ctx.shadowBlur = 0;
+        ctx.font = `${Math.min(bw, bh) * 0.25}px serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('🧺', bx + bw/2, by + bh/2);
+        
+        // Подпись
+        ctx.fillStyle = 'rgba(255,255,255,0.2)';
+        ctx.font = 'bold 16px sans-serif';
+        ctx.fillText("КОРЗИНКА", bx + bw/2, by + bh - 15);
+        ctx.restore();
+
+        // 🍎 ФРУКТЫ (эмодзи поверх тех же хитбоксов)
+        fruits.forEach(f => {
+          // Тень
+          ctx.shadowColor = 'rgba(0,0,0,0.5)';
+          ctx.shadowBlur = 10;
+          
+          ctx.font = `${f.r * 2.2}px serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          
+          if (f.placed) {
+            // Положенный фрукт - чуть прозрачнее, с галочкой
+            ctx.globalAlpha = 0.85;
+            ctx.fillText(f.emoji, f.x, f.y);
+            ctx.globalAlpha = 1.0;
+            // Галочка поверх
+            ctx.font = `${f.r}px sans-serif`;
+            ctx.fillStyle = '#4caf50';
+            ctx.fillText('✓', f.x + f.r*0.4, f.y + f.r*0.4);
+          } else {
+            // Свободный фрукт
+            ctx.fillText(f.emoji, f.x, f.y);
+            // Подсветка если наводим
+            if (hand.holding === f) {
+                ctx.strokeStyle = '#fff';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.arc(f.x, f.y, f.r + 8, 0, Math.PI*2);
+                ctx.stroke();
+            }
+          }
+          ctx.shadowBlur = 0;
+        });
+
+        // 👋 КУРСОР РУКИ
+        ctx.shadowColor = 'rgba(0,0,0,0.8)'; ctx.shadowBlur = 15;
+        ctx.font = `${hand.holding ? 70 : 60}px serif`;
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        
+        let emoji = '🖐️';
+        if (hand.gesture === 'fist') emoji = '✊';
+        else if (hand.gesture === 'transition') emoji = '✋';
+        else if (hand.gesture === 'none') emoji = '❓';
+        
+        ctx.save();
+        ctx.translate(hand.x, hand.y);
+        ctx.scale(-1, 1); // Зеркалим эмодзи
+        ctx.fillText(emoji, 0, 0);
+        ctx.restore();
+        ctx.shadowBlur = 0;
+
+        // Линия "верёвочки" если держим фрукт
+        if(hand.holding) {
+            ctx.beginPath();
+            ctx.moveTo(hand.x, hand.y);
+            ctx.lineTo(hand.holding.x, hand.holding.y);
+            ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([4, 4]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        // HUD
+        if(state === 'PLAY') {
+            metrics.smoothness = Math.max(0, 100 - (avg(metrics.jerks.slice(-30)) * 20));
+            const m = Math.floor(sessionTime/60), s = Math.floor(sessionTime%60).toString().padStart(2,'0');
+            document.getElementById('hud-timer').textContent = `${m}:${s}`;
+            document.getElementById('hud-smooth').textContent = `${Math.round(metrics.smoothness)}%`;
+
+            if (sessionTime >= CFG.sessionLen) stopGame();
+            gameLoopId = requestAnimationFrame(gameLoop);
+        }
+      }
+
+      function avg(arr){ 
+          if(!arr.length) return 0;
+          return arr.reduce((a,b)=>a+b,0)/arr.length; 
+      }
+
+      function downloadMetrics() {
+        const report = {
+          date: new Date().toISOString(),
+          task: 'fruit_basket_mirror', 
+          duration_sec: Math.round(sessionTime),
+          kinematics: { 
+              avg_velocity_px: avg(metrics.velocities).toFixed(1), 
+              avg_jerk: avg(metrics.jerks).toFixed(3), 
+              path_px: Math.round(metrics.path) 
+          },
+          performance: { 
+              completed: placedCount===7, 
+              grip_changes: metrics.gripChanges, 
+              final_smoothness: metrics.smoothness 
+          }
+        };
+        const blob = new Blob([JSON.stringify(report, null, 2)], {type:'application/json'});
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+        a.download = `fruit_game_report_${new Date().toISOString().slice(0,10)}.json`; a.click();
+      }
+
+      document.getElementById('btn-perm').addEventListener('click', initCamera);
+      document.getElementById('btn-start').addEventListener('click', startGame);
+      document.getElementById('btn-stop').addEventListener('click', stopGame);
+
+      return { downloadMetrics };
+    })();
+  </script>
+</body>
+</html>
